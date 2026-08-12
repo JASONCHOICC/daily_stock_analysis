@@ -66,11 +66,12 @@ jobs:
           ALL_STOCKS: ${{ vars.ALL_STOCKS || secrets.ALL_STOCKS }}
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
           TOP_N: ${{ vars.TOP_N || secrets.TOP_N || '20' }}
+          SNAPSHOT_MAX_RETRY: ${{ vars.SNAPSHOT_MAX_RETRY || '3' }}
+          SNAPSHOT_RETRY_BACKOFF: ${{ vars.SNAPSHOT_RETRY_BACKOFF || '2.0' }}
         run: |
           echo "📊 从自选股池按当日涨跌幅选取前 ${TOP_N} 只进行分析"
-          python scripts/top_gainers_from_list.py
-          # 脚本会输出 __STOCK_LIST__=... 行；提取并写入 GITHUB_OUTPUT
-          OUT=$(python scripts/top_gainers_from_list.py 2>/dev/null | grep '^__STOCK_LIST__=' | tail -1 | sed 's/^__STOCK_LIST__=//')
+          # 脚本会输出 __STOCK_LIST__=... 行；提取并写入 GITHUB_OUTPUT（只运行一次）
+          OUT=$(python scripts/top_gainers_from_list.py 2>&1 | tee /dev/stderr | grep '^__STOCK_LIST__=' | tail -1 | sed 's/^__STOCK_LIST__=//')
           if [ -z "$OUT" ]; then
             echo "⚠️ 动态选取失败，回退到 STOCK_LIST 静态列表"
             OUT="${{ vars.STOCK_LIST || secrets.STOCK_LIST }}"
