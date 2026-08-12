@@ -3,28 +3,28 @@
 """
 top_gainers_from_list.py
 
-从 ALL_STOCKS（用户提供的全量自选股，逗号分隔）中，按当日「涨跌幅」取前 TOP_N 只，
-写入 STOCK_LIST 环境变量（直接导出，供后续 main.py 使用）。
+从 ALL_STOCKS（用户提供的全量自选股，逗号分隔）中，剔除当日「涨停」个股后，
+按当日「涨跌幅」取前 TOP_N 只（强趋势但未封板），写入 STOCK_LIST 供后续分析。
 
 设计目标：
-- 每个交易日动态选出「当日涨幅前 TOP_N」进行分析与推送。
-- 多数据源 + 重试，尽量在 GitHub Runner 上也能成功取到当日涨幅：
+- 每个交易日动态选出「当日涨幅前 TOP_N（剔除涨停）」进行分析与推送。
+- 多数据源 + 重试，尽量在 GitHub Runner 上也能成功取到当日涨幅与涨停价：
   1) 东方财富全市场快照（akshare stock_zh_a_spot_em）——覆盖全 A，但 GitHub IP 常被限流；
   2) 腾讯行情 qt.gtimg.cn 单只批量查询（与项目 REALTIME_SOURCE_PRIORITY 首选一致）——
-     只需你提供的 146 只代码即可，天然规避全市场快照的限流；
-  3) 新浪行情 hq.sinajs.cn 单只批量查询——备用。
+     只需你提供的 146 只代码即可，天然规避全市场快照的限流，且直接给出涨停价；
+  3) 新浪行情 hq.sinajs.cn 单只批量查询——备用（涨停价需按板块推算）。
 - 上述全部失败时才回退到 ALL_STOCKS 的前 TOP_N 只（静态），保证每日运行不整跑失败。
 """
 from __future__ import annotations
 
 import os
 import sys
-import json
 import time
+import types
 import urllib.request
 import urllib.parse
 
-TOP_N = int(os.getenv("TOP_N", "20"))
+TOP_N = int(os.getenv("TOP_N", "10"))
 SNAPSHOT_MAX_RETRY = int(os.getenv("SNAPSHOT_MAX_RETRY", "3"))
 SNAPSHOT_RETRY_BACKOFF = float(os.getenv("SNAPSHOT_RETRY_BACKOFF", "2.0"))
 
@@ -50,6 +50,16 @@ def to_sina_symbol(code: str) -> str:
     return to_tencent_symbol(code)
 
 
+def _limit_up_ratio(code: str, name: str = "") -> float:
+    """按板块返回涨停幅度（ST=5%，双创/创业板=20%，其余=10%）。"""
+    n = (name or "").upper()
+    if n.startswith("*ST") or n.startswith("ST"):
+        return 0.05
+    if code.startswith(("688", "689", "300", "301", "302")):
+        return 0.20
+    return 0.10
+
+
 def resolve_all_stocks() -> list[str]:
     raw = os.getenv("ALL_STOCKS", "") or os.getenv("STOCK_LIST", "")
     if not raw.strip():
@@ -61,8 +71,19 @@ def pick_static_front(all_stocks: list[str], n: int) -> list[str]:
     return all_stocks[:n]
 
 
-def _snapshot_via_eastmoney() -> dict[str, float] | None:
-    """东方财富全市场快照。返回 {code: change_pct}；失败返回 None。"""
+def _is_limit_up(price: float, up_price: float, preclose: float, code: str, name: str = "") -> bool:
+    """判定是否涨停：优先用真实涨停价比较；否则按板块幅度推算。"""
+    if price <= 0:
+        return False
+    if up_price > 0:
+        return price >= up_price - 0.02
+    if preclose > 0:
+        return price >= preclose * (1.0 + _limit_up_ratio(code, name)) - 0.02
+    return False
+
+
+def _snapshot_via_eastmoney() -> dict[str, dict] | None:
+    """东方财富全市场快照。返回 {code: {"chg":.., "lu":..}}；失败返回 None。"""
     try:
         import akshare as ak
     except Exception as e:  # noqa: BLE001
@@ -75,14 +96,21 @@ def _snapshot_via_eastmoney() -> dict[str, float] | None:
             if df is None or "代码" not in df.columns or "涨跌幅" not in df.columns:
                 last_err = "snapshot missing columns"
                 break
-            out: dict[str, float] = {}
+            out: dict[str, dict] = {}
+            has_up = "涨停价" in df.columns
+            has_cur = "最新价" in df.columns
+            has_pre = "昨收" in df.columns
             for _, row in df.iterrows():
                 code = normalize(str(row.get("代码", "")))
                 try:
                     chg = float(row.get("涨跌幅"))
                 except (TypeError, ValueError):
                     chg = float("-inf")
-                out[code] = chg
+                price = float(row.get("最新价", 0)) if has_cur else 0.0
+                up_price = float(row.get("涨停价", 0)) if has_up else 0.0
+                preclose = float(row.get("昨收", 0)) if has_pre else 0.0
+                lu = _is_limit_up(price, up_price, preclose, code)
+                out[code] = {"chg": chg, "lu": lu}
             return out
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
@@ -92,8 +120,8 @@ def _snapshot_via_eastmoney() -> dict[str, float] | None:
     return None
 
 
-def _fetch_tencent(codes: list[str]) -> dict[str, float] | None:
-    """腾讯行情 qt.gtimg.cn 批量查询。返回 {code: change_pct}；失败返回 None。"""
+def _fetch_tencent(codes: list[str]) -> dict[str, dict] | None:
+    """腾讯行情 qt.gtimg.cn 批量查询。返回 {code: {"chg":.., "lu":..}}；失败返回 None。"""
     if not codes:
         return None
     syms = [to_tencent_symbol(c) for c in codes]
@@ -106,8 +134,9 @@ def _fetch_tencent(codes: list[str]) -> dict[str, float] | None:
     except Exception as e:  # noqa: BLE001
         print(f"[tencent] fetch failed: {e}", file=sys.stderr)
         return None
-    out: dict[str, float] = {}
-    # 每行: v_sh600519="..."; 字段以 ~ 分隔，第 32 位是 涨跌幅(%)
+    out: dict[str, dict] = {}
+    # 每行: v_sh600519="名称~代码~今开~现价~昨收~...~涨跌幅~涨停价~跌停价"; 字段以 ~ 分隔
+    # 关键索引: 1=名称, 3=现价, 4=昨收, 32=涨跌幅(%), 33=涨停价
     for line in raw.split(";"):
         line = line.strip()
         if not line or "=" not in line:
@@ -121,13 +150,24 @@ def _fetch_tencent(codes: list[str]) -> dict[str, float] | None:
             chg = float(fields[32])
         except (IndexError, ValueError):
             chg = float("-inf")
+        try:
+            price = float(fields[3])
+            preclose = float(fields[4])
+        except (IndexError, ValueError):
+            price = preclose = 0.0
+        try:
+            up_price = float(fields[33])
+        except (IndexError, ValueError):
+            up_price = 0.0
+        name = fields[1] if len(fields) > 1 else ""
         base = normalize(sym)
-        out[base] = chg
+        lu = _is_limit_up(price, up_price, preclose, base, name)
+        out[base] = {"chg": chg, "lu": lu}
     return out if out else None
 
 
-def _fetch_sina(codes: list[str]) -> dict[str, float] | None:
-    """新浪行情 hq.sinajs.cn 批量查询。返回 {code: change_pct}；失败返回 None。"""
+def _fetch_sina(codes: list[str]) -> dict[str, dict] | None:
+    """新浪行情 hq.sinajs.cn 批量查询。返回 {code: {"chg":.., "lu":..}}；失败返回 None。"""
     if not codes:
         return None
     syms = [to_sina_symbol(c) for c in codes]
@@ -140,9 +180,9 @@ def _fetch_sina(codes: list[str]) -> dict[str, float] | None:
     except Exception as e:  # noqa: BLE001
         print(f"[sina] fetch failed: {e}", file=sys.stderr)
         return None
-    out: dict[str, float] = {}
-    # 每行: var hq_str_sh600519="名称,今开,昨收,...,涨跌,涨跌幅,...";
-    # 注意新浪的「涨跌幅」字段是按昨收的百分比，需结合 涨跌 与 昨收 计算更稳妥：
+    out: dict[str, dict] = {}
+    # 每行: var hq_str_sh600519="名称,今开,昨收,现价,...,涨跌,涨跌幅,...";
+    # 索引: 0=名称, 2=昨收, 3=现价, 13=涨跌, 14=涨跌幅(%)
     for line in raw.splitlines():
         if "=" not in line:
             continue
@@ -152,28 +192,28 @@ def _fetch_sina(codes: list[str]) -> dict[str, float] | None:
             continue
         fields = payload.split(",")
         try:
-            pre_close = float(fields[2])
-            change = float(fields[3])
-            chg = (change / pre_close * 100.0) if pre_close else 0.0
+            preclose = float(fields[2])
+            price = float(fields[3])
+            chg = (price - preclose) / preclose * 100.0 if preclose else 0.0
         except (IndexError, ValueError, ZeroDivisionError):
-            chg = float("-inf")
-        out[normalize(sym)] = chg
+            price = preclose = chg = 0.0
+        name = fields[0] if fields else ""
+        base = normalize(sym)
+        lu = _is_limit_up(price, 0.0, preclose, base, name)
+        out[base] = {"chg": chg, "lu": lu}
     return out if out else None
 
 
-def build_change_map(all_stocks: list[str]) -> tuple[dict[str, float], str]:
-    """依次尝试各数据源，返回 (code->change_pct, 来源描述)。全失败返回 ({}, 原因)。"""
-    # 1) 东方财富全市场快照
+def build_change_map(all_stocks: list[str]) -> tuple[dict[str, dict], str]:
+    """依次尝试各数据源，返回 (code->{"chg","lu"}, 来源描述)。全失败返回 ({}, 原因)。"""
     m = _snapshot_via_eastmoney()
     if m:
         return m, "eastmoney snapshot"
 
-    # 2) 腾讯单只批量（只需 146 只代码，天然避限流）
     m = _fetch_tencent(all_stocks)
     if m:
         return m, "tencent batch"
 
-    # 3) 新浪单只批量
     m = _fetch_sina(all_stocks)
     if m:
         return m, "sina batch"
@@ -186,14 +226,15 @@ def pick_top_gainers(all_stocks: list[str], n: int) -> tuple[list[str], str]:
     if not change_map:
         return pick_static_front(all_stocks, n), "fallback to static front (no realtime data)"
 
-    matched = [(c, change_map.get(c, float("-inf"))) for c in all_stocks if c in change_map]
+    # 剔除涨停，再按涨跌幅倒序取前 n
+    matched = [(c, change_map[c]["chg"]) for c in all_stocks
+               if c in change_map and not change_map[c]["lu"]]
     if not matched:
-        return pick_static_front(all_stocks, n), "fallback to static front (no overlap)"
-
+        return pick_static_front(all_stocks, n), "fallback to static front (all limit-up)"
     matched.sort(key=lambda x: x[1], reverse=True)
     top = [c for c, _ in matched[:n]]
     reasons = ", ".join(f"{c}:{chg:+.2f}%" for c, chg in matched[:n])
-    return top, f"top gainers via {src}: {reasons}"
+    return top, f"top gainers (excl. limit-up) via {src}: {reasons}"
 
 
 def main() -> int:
