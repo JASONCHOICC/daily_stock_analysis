@@ -2859,6 +2859,18 @@ class NotificationService(
             f.write(content)
 
         logger.info(f"日报已保存到: {filepath}")
+
+        # 同步导出可分享的 HTML 版本（与 .md 同目录、同名 .html）
+        try:
+            from src.formatters import markdown_to_html_document
+            html_content = markdown_to_html_document(content)
+            html_path = reports_dir / filename.rsplit('.', 1)[0] + '.html'
+            with open(html_path, 'w', encoding='utf-8') as hf:
+                hf.write(html_content)
+            logger.info(f"日报 HTML 已保存到: {html_path}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"日报 HTML 导出失败（不影响主报告）: {e}")
+
         return str(filepath)
 
     def save_and_send_feishu_file(
