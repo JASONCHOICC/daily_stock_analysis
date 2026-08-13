@@ -3308,6 +3308,11 @@ class GeminiAnalyzer:
                 safe_error = self._sanitize_litellm_exception_text(e, config=config, model=model)
                 logger.warning("[LiteLLM] %s failed: %s", model, safe_error)
                 last_error = RuntimeError(f"{type(e).__name__}: {safe_error}")
+                # 触发限流时在回退下一个模型前做指数退避，缓解免费额度 RPM 限制
+                if isinstance(e, litellm.RateLimitError) or "RateLimit" in type(e).__name__:
+                    backoff = getattr(config, "llm_rate_limit_backoff", 8.0) or 8.0
+                    logger.warning("[LiteLLM] 检测到限流，退避 %.1f 秒后重试/回退", backoff)
+                    time.sleep(backoff)
                 continue
 
         raise _AllModelsFailedError(

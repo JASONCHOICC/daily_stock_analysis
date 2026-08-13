@@ -1,10 +1,10 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
+  # 定时触发 - 每个交易日北京时间 08:30 (UTC 00:30)
   schedule:
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
-  
+    - cron: '30 0 * * 1-5'     # 周一到周五，UTC 00:30 = 北京时间 08:30
+
   # 手动触发
   workflow_dispatch:
     inputs:
@@ -97,6 +97,9 @@ jobs:
           LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
           LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
           LITELLM_FALLBACK_MODELS: ${{ vars.LITELLM_FALLBACK_MODELS || secrets.LITELLM_FALLBACK_MODELS }}
+          # LiteLLM 内置重试 + 退避，缓解免费额度 429/RateLimit
+          LITELLM_NUM_RETRIES: ${{ vars.LITELLM_NUM_RETRIES || '5' }}
+          LITELLM_REQUEST_TIMEOUT: ${{ vars.LITELLM_REQUEST_TIMEOUT || '120' }}
           AGENT_LITELLM_MODEL: ${{ vars.AGENT_LITELLM_MODEL || secrets.AGENT_LITELLM_MODEL }}
           VISION_MODEL: ${{ vars.VISION_MODEL || secrets.VISION_MODEL }}
           OPENAI_VISION_MODEL: ${{ vars.OPENAI_VISION_MODEL || secrets.OPENAI_VISION_MODEL }}
