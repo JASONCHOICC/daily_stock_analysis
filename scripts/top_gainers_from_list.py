@@ -67,8 +67,30 @@ def resolve_all_stocks() -> list[str]:
     return [normalize(x) for x in raw.split(",") if x.strip()]
 
 
+def is_individual_stock(code: str) -> bool:
+    """判断是否为个股（排除 ETF/基金/指数）。
+
+    A股个股代码规律：
+      - 沪市主板/科创板：60xxxx、688xxx、689xxx
+      - 深市主板/创业板：00xxxx、30xxx（300/301/302 创业板）
+      - 北交所：8xxxxx、43xxxx、92xxxx（920xxx）
+    基金/ETF 一律以 5 或 1 开头（如 517180、159516、510300），指数如 000688。
+    """
+    if not code or not code.isdigit() or len(code) != 6:
+        return False
+    if code.startswith(("5", "1")):  # 基金/ETF
+        return False
+    if code in ("000688",):  # 科创50 等指数
+        return False
+    if code.startswith("000") and code != "000688":
+        # 000xxx 多为深市主板个股（如 000063 中兴通讯），保留
+        return True
+    return code[:2] in ("60", "68", "69", "00", "30", "43", "92", "88", "83", "87")
+
+
 def pick_static_front(all_stocks: list[str], n: int) -> list[str]:
-    return all_stocks[:n]
+    tradeable = [c for c in all_stocks if is_individual_stock(c)]
+    return (tradeable or all_stocks)[:n]
 
 
 def _is_limit_up(price: float, up_price: float, preclose: float, code: str, name: str = "") -> bool:
@@ -226,11 +248,11 @@ def pick_top_gainers(all_stocks: list[str], n: int) -> tuple[list[str], str]:
     if not change_map:
         return pick_static_front(all_stocks, n), "fallback to static front (no realtime data)"
 
-    # 剔除涨停，再按涨跌幅倒序取前 n
+    # 仅考虑个股（排除 ETF/基金/指数），剔除涨停，再按涨跌幅倒序取前 n
     matched = [(c, change_map[c]["chg"]) for c in all_stocks
-               if c in change_map and not change_map[c]["lu"]]
+               if c in change_map and is_individual_stock(c) and not change_map[c]["lu"]]
     if not matched:
-        return pick_static_front(all_stocks, n), "fallback to static front (all limit-up)"
+        return pick_static_front(all_stocks, n), "fallback to static front (all limit-up/non-stock)"
     matched.sort(key=lambda x: x[1], reverse=True)
     top = [c for c, _ in matched[:n]]
     reasons = ", ".join(f"{c}:{chg:+.2f}%" for c, chg in matched[:n])
