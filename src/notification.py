@@ -2864,7 +2864,8 @@ class NotificationService(
         try:
             from src.formatters import markdown_to_html_document
             html_content = markdown_to_html_document(content)
-            html_path = reports_dir / filename.rsplit('.', 1)[0] + '.html'
+            html_name = filename.rsplit('.', 1)[0] + '.html'
+            html_path = reports_dir / html_name
             with open(html_path, 'w', encoding='utf-8') as hf:
                 hf.write(html_content)
             logger.info(f"日报 HTML 已保存到: {html_path}")
